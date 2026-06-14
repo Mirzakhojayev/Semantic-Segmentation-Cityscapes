@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+venv/
+dataset/
+logs/
+load_pretrained_model.py
+segformer_b1_pretrained_encoder.pth

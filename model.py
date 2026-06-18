@@ -1,8 +1,22 @@
 import math
+from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _fp32_layernorm_hook(module, args, output):
+    """Force LayerNorm output back to fp32 so downstream ops stay stable."""
+    return output.to(torch.float32)
+
+
+def apply_fp32_layernorm(model: nn.Module) -> None:
+    """Register a forward hook on every LayerNorm so it always outputs fp32.
+    Safe to call even when not using AMP — it is a no-op in fp32 mode."""
+    for m in model.modules():
+        if isinstance(m, nn.LayerNorm):
+            m.register_forward_hook(_fp32_layernorm_hook)
 
 
 class StochasticDepth(nn.Module):
@@ -112,11 +126,20 @@ class Attention(nn.Module):
         kv = kv.reshape(B, -1, 2, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # F.scaled_dot_product_attention is numerically stable in fp16
+        # (uses flash attention when available, avoids softmax(inf) NaN overflow).
+        # scale= kwarg was added in PyTorch 2.1; fall back for older versions.
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        try:
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, scale=self.scale
+            )
+        except TypeError:
+            # PyTorch < 2.1 does not accept scale= keyword
+            q = q * self.scale
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -197,7 +220,7 @@ class MixVisionTransformer(nn.Module):
         drop_path_rate=0.1,
         depths=(2, 2, 2, 2),
         sr_ratios=(8, 4, 2, 1),
-        norm_eps=1e-6,
+        norm_eps=1e-5,  # 1e-5 avoids fp16 NaN on Turing (GTX 16xx) GPUs
     ):
         super().__init__()
         self.depths = depths
@@ -294,6 +317,8 @@ class MixVisionTransformer(nn.Module):
         self.norm4 = nn.LayerNorm(embed_dims[3], eps=norm_eps)
 
         self.apply(_init_weights)
+        # Ensure all LayerNorm ops stay in fp32 when AMP is active
+        apply_fp32_layernorm(self)
 
     def forward(self, x):
         B = x.shape[0]
@@ -334,19 +359,20 @@ class MixVisionTransformer(nn.Module):
         return outs
 
 
-def mit_b1(drop_path_rate=0.1, **kwargs):
-    """MiT-B1 configuration (used by SegFormer-B1)."""
+def mit_b2(drop_path_rate=0.1, **kwargs):
+    """MiT-B2 encoder: 16 transformer blocks across 4 stages (~25M params)."""
     return MixVisionTransformer(
         embed_dims=(64, 128, 320, 512),
         num_heads=(1, 2, 5, 8),
         mlp_ratios=(4, 4, 4, 4),
         qkv_bias=True,
-        depths=(2, 2, 2, 2),
+        depths=(3, 4, 6, 3),
         sr_ratios=(8, 4, 2, 1),
         drop_path_rate=drop_path_rate,
-        norm_eps=1e-6,
+        norm_eps=1e-5,
         **kwargs,
     )
+
 
 # Decoder head
 
@@ -429,9 +455,11 @@ class SegFormerHead(nn.Module):
 
 
 class SegFormer(nn.Module):
+    """SegFormer-B2: MiT-B2 encoder + all-MLP decoder head."""
+
     def __init__(self, num_classes=19, decoder_embed_dim=256, drop_path_rate=0.1):
         super().__init__()
-        self.encoder = mit_b1(drop_path_rate=drop_path_rate)
+        self.encoder = mit_b2(drop_path_rate=drop_path_rate)
         self.decode_head = SegFormerHead(
             in_channels=(64, 128, 320, 512),
             embed_dim=decoder_embed_dim,
